@@ -1,7 +1,11 @@
 /*
- * socks5.c - Socks代理扫描工具 v3.5
- * 交互式模式 | 支持用户名/密码认证测试
- * Target: FreeBSD x86-64, compile with: cc -o socks5 socks5.c src/parse.c src/socks5_proto.c
+ * socks5.c - Socks代理扫描工具 v4.0
+ * 支持命令行参数 + 交互式模式 | 支持用户名/密码认证测试
+ * Target: FreeBSD x86-64, compile with: cc -o socks5 socks5.c -lpthread
+ *
+ * 用法:
+ *   交互式: ./socks5
+ *   命令行: ./socks5 -i check.txt -p 1080 -t 50 -T 5 -o socks.txt -c credentials.txt
  */
 
 #include <stdio.h>
@@ -13,56 +17,23 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/event.h>
-#include <sys/time.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-
-#include "include/parse.h"
-#include "include/socks5_proto.h"
+#include <poll.h>
+#include <pthread.h>
 
 /* ======================== 常量与默认值 ======================== */
 #define DEFAULT_PORT       "1080"
 #define DEFAULT_CRED_FILE  "credentials.txt"
 #define DEFAULT_OUTPUT     "socks.txt"
 #define DEFAULT_CHECK      "check.txt"
+#define DEFAULT_THREADS    "100"
 #define DEFAULT_TIMEOUT    "5"
-#define DEFAULT_KQUEUE_CONCURRENCY 1000
-#define KQUEUE_RLIMIT_MARGIN 50
 
 /* ======================== 数据结构 ======================== */
-
-typedef enum {
-    CONN_ST_UNUSED = 0,
-    CONN_ST_CONNECTING,
-    CONN_ST_PROBE_SEND,
-    CONN_ST_PROBE_RECV,
-    CONN_ST_AUTH_SEND,
-    CONN_ST_AUTH_RECV,
-    CONN_ST_DONE,
-    CONN_ST_FAILED
-} ConnState;
-
-typedef struct {
-    int fd;
-    unsigned int ip;
-    int port;
-    int phase;
-    int cred_idx;
-    ConnState state;
-    double start_ts;
-    double last_io_ts;
-    unsigned char rbuf[512];
-    size_t rlen;
-    unsigned char sbuf[512];
-    size_t slen;
-    size_t soff;
-    int want_read;
-    int want_write;
-} Conn;
 
 /* 凭证 */
 typedef struct {
@@ -76,6 +47,43 @@ typedef struct {
     size_t cap;
 } CredList;
 
+/* 任务队列 — 仅用于 phase 0 探测 */
+typedef struct {
+    unsigned int ip;   /* 主机字节序 */
+    int          port;
+} Task;
+
+typedef struct {
+    Task  *buf;
+    size_t cap;
+    size_t head;
+    size_t tail;
+    size_t count;
+    int    closed;
+    pthread_mutex_t lock;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+} TaskQueue;
+
+/* 端口列表 */
+typedef struct {
+    int   *ports;
+    size_t count;
+    size_t cap;
+} PortList;
+
+/* IP迭代器 token */
+typedef struct {
+    unsigned int start;
+    unsigned int end;
+} IpRange;
+
+typedef struct {
+    IpRange *ranges;
+    size_t   count;
+    size_t   cap;
+} IpList;
+
 /* 全局状态 */
 static volatile int g_stop = 0;
 static unsigned long long g_total_tasks = 0;
@@ -83,10 +91,11 @@ static unsigned long long g_done_tasks  = 0;
 static unsigned long long g_found       = 0;
 static unsigned long long g_auth_total  = 0;
 static unsigned long long g_auth_done   = 0;
+static pthread_mutex_t g_stat_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_outfp = NULL;
+static pthread_mutex_t g_out_lock = PTHREAD_MUTEX_INITIALIZER;
 static CredList g_creds = {0};
 static double g_start_time = 0;
-static double g_timeout = 5.0;
 
 /* ======================== 工具函数 ======================== */
 
@@ -99,6 +108,10 @@ static double now_sec(void) {
 static void on_sigint(int sig) {
     (void)sig;
     g_stop = 1;
+}
+
+static int cmp_int(const void *a, const void *b) {
+    return (*(const int *)a) - (*(const int *)b);
 }
 
 static char *trim(char *s) {
@@ -126,12 +139,28 @@ static char *get_input(const char *prompt, const char *def) {
     return strdup(p);
 }
 
+/* 完整发送，处理 EINTR 和部分发送 */
+static int send_all(int fd, const unsigned char *buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(fd, buf + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += n;
+    }
+    return sent;
+}
+
 /* ======================== 凭证管理 ======================== */
 
 static void add_cred(CredList *cl, const char *user, const char *pass) {
     if (cl->count >= cl->cap) {
         cl->cap = cl->cap ? cl->cap * 2 : 16;
-        cl->items = realloc(cl->items, cl->cap * sizeof(Cred));
+        void *tmp = realloc(cl->items, cl->cap * sizeof(Cred));
+        if (!tmp) { fprintf(stderr, "[!] realloc failed\n"); return; }
+        cl->items = tmp;
     }
     cl->items[cl->count].user = strdup(user);
     cl->items[cl->count].pass = strdup(pass);
@@ -174,22 +203,319 @@ static int load_creds(CredList *cl, const char *path) {
     return 0;
 }
 
+/* ======================== 任务队列 ======================== */
+
+static int tq_init(TaskQueue *q, size_t cap) {
+    q->buf = calloc(cap, sizeof(Task));
+    if (!q->buf) return -1;
+    q->cap = cap;
+    q->head = q->tail = q->count = 0;
+    q->closed = 0;
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+    return 0;
+}
+
+static void tq_destroy(TaskQueue *q) {
+    pthread_mutex_destroy(&q->lock);
+    pthread_cond_destroy(&q->not_empty);
+    pthread_cond_destroy(&q->not_full);
+    free(q->buf);
+    q->buf = NULL;
+}
+
+static void tq_push(TaskQueue *q, Task *t) {
+    pthread_mutex_lock(&q->lock);
+    while (q->count >= q->cap && !q->closed && !g_stop)
+        pthread_cond_wait(&q->not_full, &q->lock);
+    if (q->closed || g_stop) {
+        pthread_mutex_unlock(&q->lock);
+        return;
+    }
+    q->buf[q->tail] = *t;
+    q->tail = (q->tail + 1) % q->cap;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+}
+
+static int tq_pop(TaskQueue *q, Task *t) {
+    pthread_mutex_lock(&q->lock);
+    while (q->count == 0 && !q->closed)
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    if (q->count == 0 && q->closed) {
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
+    *t = q->buf[q->head];
+    q->head = (q->head + 1) % q->cap;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
+    return 0;
+}
+
+static void maybe_close_queue(TaskQueue *q) {
+    pthread_mutex_lock(&q->lock);
+    q->closed = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
+}
+
+static void queue_task(TaskQueue *q, unsigned int ip, int port) {
+    Task t;
+    t.ip = ip;
+    t.port = port;
+    tq_push(q, &t);
+}
+
+/* ======================== IP解析 ======================== */
+
+static unsigned int ip_to_u32(const char *s) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, s, &addr) != 1) return 0;
+    return ntohl(addr.s_addr);
+}
+
+static void u32_to_ip(unsigned int ip, char *buf, size_t len) {
+    struct in_addr addr;
+    addr.s_addr = htonl(ip);
+    inet_ntop(AF_INET, &addr, buf, len);
+}
+
+static void iplist_add(IpList *list, unsigned int start, unsigned int end) {
+    if (list->count >= list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 256;
+        list->ranges = realloc(list->ranges, list->cap * sizeof(IpRange));
+    }
+    list->ranges[list->count].start = start;
+    list->ranges[list->count].end = end;
+    list->count++;
+}
+
+/* 解析单个IP token: 单IP, CIDR, 或范围 */
+static int parse_token_ipv4(IpList *list, const char *token) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", token);
+
+    /* CIDR: 192.168.0.0/24 */
+    char *slash = strchr(tmp, '/');
+    if (slash) {
+        *slash = 0;
+        unsigned int base = ip_to_u32(tmp);
+        if (base == 0 && strcmp(tmp, "0.0.0.0") != 0) return -1;
+        int prefix = (int)strtol(slash + 1, NULL, 10);
+        if (prefix < 0 || prefix > 32) return -1;
+        unsigned int mask = prefix == 0 ? 0 : (~0U << (32 - prefix));
+        unsigned int start = base & mask;
+        unsigned int end = start | ~mask;
+        iplist_add(list, start, end);
+        return 0;
+    }
+
+    /* 范围: 192.168.0.1-192.168.0.100 */
+    char *dash = strchr(tmp, '-');
+    if (dash) {
+        /* 检查dash后面是否是完整IP */
+        if (strchr(dash + 1, '.')) {
+            *dash = 0;
+            unsigned int s = ip_to_u32(tmp);
+            unsigned int e = ip_to_u32(dash + 1);
+            if (s == 0 || e == 0 || s > e) return -1;
+            iplist_add(list, s, e);
+            return 0;
+        }
+        /* 简写: 192.168.0.1-100 */
+        *dash = 0;
+        unsigned int s = ip_to_u32(tmp);
+        if (s == 0) return -1;
+        int end_octet = (int)strtol(dash + 1, NULL, 10);
+        if (end_octet < 0 || end_octet > 255) return -1;
+        unsigned int e = (s & 0xFFFFFF00) | (unsigned int)end_octet;
+        if (s > e) return -1;
+        iplist_add(list, s, e);
+        return 0;
+    }
+
+    /* 单个IP */
+    unsigned int ip = ip_to_u32(tmp);
+    if (ip == 0 && strcmp(tmp, "0.0.0.0") != 0) return -1;
+    iplist_add(list, ip, ip);
+    return 0;
+}
+
+static unsigned long long count_token_fast_ipv4(IpList *list) {
+    unsigned long long total = 0;
+    for (size_t i = 0; i < list->count; i++) {
+        total += (unsigned long long)(list->ranges[i].end - list->ranges[i].start + 1);
+    }
+    return total;
+}
+
+typedef struct {
+    IpList *list;
+    size_t  range_idx;
+    unsigned int cur_ip;
+} IpIter;
+
+static void iptok_init_iter(IpIter *it, IpList *list) {
+    it->list = list;
+    it->range_idx = 0;
+    it->cur_ip = (list->count > 0) ? list->ranges[0].start : 0;
+}
+
+static int iptok_next(IpIter *it, unsigned int *out) {
+    while (it->range_idx < it->list->count) {
+        IpRange *r = &it->list->ranges[it->range_idx];
+        if (it->cur_ip <= r->end) {
+            *out = it->cur_ip++;
+            return 1;
+        }
+        it->range_idx++;
+        if (it->range_idx < it->list->count)
+            it->cur_ip = it->list->ranges[it->range_idx].start;
+    }
+    return 0;
+}
+
+/* 解析端口范围字符串 */
+static PortList parse_ports(const char *s) {
+    PortList pl = {0};
+    char *dup = strdup(s);
+    char *tok = strtok(dup, ", \t");
+    while (tok) {
+        char *dash = strchr(tok, '-');
+        if (dash) {
+            *dash = 0;
+            int a = (int)strtol(tok, NULL, 10);
+            int b = (int)strtol(dash + 1, NULL, 10);
+            for (int p = a; p <= b && p <= 65535; p++) {
+                if (pl.count >= pl.cap) {
+                    pl.cap = pl.cap ? pl.cap * 2 : 64;
+                    pl.ports = realloc(pl.ports, pl.cap * sizeof(int));
+                }
+                pl.ports[pl.count++] = p;
+            }
+        } else {
+            int p = (int)strtol(tok, NULL, 10);
+            if (p > 0 && p <= 65535) {
+                if (pl.count >= pl.cap) {
+                    pl.cap = pl.cap ? pl.cap * 2 : 64;
+                    pl.ports = realloc(pl.ports, pl.cap * sizeof(int));
+                }
+                pl.ports[pl.count++] = p;
+            }
+        }
+        tok = strtok(NULL, ", \t");
+    }
+    free(dup);
+    /* 去重排序 */
+    if (pl.count > 1) {
+        qsort(pl.ports, pl.count, sizeof(int), cmp_int);
+        size_t j = 1;
+        for (size_t i = 1; i < pl.count; i++) {
+            if (pl.ports[i] != pl.ports[j-1])
+                pl.ports[j++] = pl.ports[i];
+        }
+        pl.count = j;
+    }
+    return pl;
+}
+
 /* ======================== 网络与SOCKS5 ======================== */
+
+static int connect_with_timeout(unsigned int ip, int port, double timeout_sec) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    /* 设置发送/接收超时 */
+    struct timeval so_tv;
+    so_tv.tv_sec = (long)timeout_sec;
+    so_tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &so_tv, sizeof(so_tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &so_tv, sizeof(so_tv));
+
+    /* 设置非阻塞 */
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(ip);
+
+    int ret = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (ret == 0) {
+        fcntl(fd, F_SETFL, flags); /* 恢复阻塞 */
+        return fd;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    /* 使用 poll 替代 select，避免 FD_SETSIZE 越界 */
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+
+    ret = poll(&pfd, 1, (int)(timeout_sec * 1000));
+    if (ret <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+    if (err) {
+        close(fd);
+        return -1;
+    }
+
+    fcntl(fd, F_SETFL, flags);
+    return fd;
+}
+
+static int sock_send_recv(int fd, const unsigned char *sbuf, int slen,
+                          unsigned char *rbuf, int rlen, double timeout_sec) {
+    if (send_all(fd, sbuf, slen) < 0) return -1;
+
+    /* 使用 poll 替代 select */
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int ret = poll(&pfd, 1, (int)(timeout_sec * 1000));
+    if (ret <= 0) return -1;
+
+    int n = recv(fd, rbuf, rlen, 0);
+    return n;
+}
 
 /* 报告发现的代理 */
 static void report_hit(unsigned int ip, int port, const char *info) {
     char ipbuf[64];
     u32_to_ip(ip, ipbuf, sizeof(ipbuf));
 
+    pthread_mutex_lock(&g_stat_lock);
     g_found++;
+    pthread_mutex_unlock(&g_stat_lock);
 
     printf("[+] %s:%d -> %s\n", ipbuf, port, info);
     fflush(stdout);
 
+    pthread_mutex_lock(&g_out_lock);
     if (g_outfp) {
         fprintf(g_outfp, "%s:%d -> %s\n", ipbuf, port, info);
         fflush(g_outfp);
     }
+    pthread_mutex_unlock(&g_out_lock);
 }
 
 /* 格式化剩余时间 */
@@ -202,7 +528,7 @@ static void fmt_eta(double secs, char *buf, size_t len) {
         snprintf(buf, len, "%.1f秒", secs);
 }
 
-/* 进度显示 */
+/* 进度显示 — 探测进度和认证进度独立显示 */
 static void print_progress(void) {
     double elapsed = now_sec() - g_start_time;
     double rate = (g_done_tasks > 0 && elapsed > 0) ? g_done_tasks / elapsed : 0;
@@ -220,403 +546,181 @@ static void print_progress(void) {
     fflush(stdout);
 }
 
-/* ======================== kqueue 事件循环骨架 ======================== */
+/* ======================== 认证逻辑 ======================== */
 
-static int kq_init(void) {
-    int kq = kqueue();
-    return kq;
-}
+/*
+ * 在当前线程内直接完成所有认证尝试，不推回队列。
+ * 避免 P2 死锁问题。
+ */
+static void try_auth_in_place(unsigned int ip, int port, double timeout) {
+    size_t total = g_creds.count;
+    pthread_mutex_lock(&g_stat_lock);
+    g_auth_total += total;
+    pthread_mutex_unlock(&g_stat_lock);
 
-static int kq_update_conn_events(int kq, Conn *c, int want_read, int want_write) {
-    struct kevent evs[2];
-    int n = 0;
+    size_t attempted = 0;
 
-    if (want_read != c->want_read) {
-        EV_SET(&evs[n++], (uintptr_t)c->fd, EVFILT_READ,
-               want_read ? (EV_ADD | EV_ENABLE) : EV_DELETE,
-               0, 0, c);
-        c->want_read = want_read;
-    }
-    if (want_write != c->want_write) {
-        EV_SET(&evs[n++], (uintptr_t)c->fd, EVFILT_WRITE,
-               want_write ? (EV_ADD | EV_ENABLE) : EV_DELETE,
-               0, 0, c);
-        c->want_write = want_write;
-    }
+    for (size_t i = 0; i < total && !g_stop; i++) {
+        attempted++;
+        int fd = connect_with_timeout(ip, port, timeout);
+        if (fd < 0) {
+            pthread_mutex_lock(&g_stat_lock);
+            g_auth_done++;
+            pthread_mutex_unlock(&g_stat_lock);
+            continue;
+        }
 
-    if (n == 0) return 0;
-    return kevent(kq, evs, n, NULL, 0, NULL);
-}
+        /* 先发送支持用户名密码认证的握手 */
+        unsigned char req[4] = {0x05, 0x02, 0x00, 0x02};
+        unsigned char resp[2] = {0};
+        int n = sock_send_recv(fd, req, 4, resp, 2, timeout);
 
-static void stats_add_done(unsigned long long done, unsigned long long auth_done) {
-    g_done_tasks += done;
-    g_auth_done += auth_done;
-}
+        if (n == 2 && resp[0] == 0x05 && resp[1] == 0x02) {
+            /* 服务器接受用户名/密码认证，发送凭证 */
+            Cred *c = &g_creds.items[i];
+            int ulen = (int)strlen(c->user);
+            int plen = (int)strlen(c->pass);
+            unsigned char authbuf[515];
+            int alen = 0;
+            authbuf[alen++] = 0x01; /* 子协商版本 */
+            authbuf[alen++] = (unsigned char)ulen;
+            memcpy(authbuf + alen, c->user, ulen); alen += ulen;
+            authbuf[alen++] = (unsigned char)plen;
+            memcpy(authbuf + alen, c->pass, plen); alen += plen;
 
-static void stats_add_auth_total(unsigned long long count) {
-    g_auth_total += count;
-    g_total_tasks += count;
-}
+            unsigned char aresp[2] = {0};
+            n = sock_send_recv(fd, authbuf, alen, aresp, 2, timeout);
 
-static int conn_prepare_hello(Conn *c) {
-    size_t len = socks5_build_hello(c->sbuf, sizeof(c->sbuf), g_creds.count > 0);
-    if (len == 0) return -1;
-    c->slen = len;
-    c->soff = 0;
-    return 0;
-}
+            if (n == 2 && aresp[1] == 0x00) {
+                char info[256];
+                snprintf(info, sizeof(info), "Socks5 (认证成功: %s:%s)", c->user, c->pass);
+                report_hit(ip, port, info);
+                close(fd);
+                pthread_mutex_lock(&g_stat_lock);
+                g_auth_done += (total - attempted + 1);
+                pthread_mutex_unlock(&g_stat_lock);
+                return; /* 找到有效凭证，停止 */
+            }
+        }
 
-static int conn_prepare_auth_payload(Conn *c, const Cred *cred) {
-    int alen = socks5_build_auth(c->sbuf, sizeof(c->sbuf), cred->user, cred->pass);
-    if (alen < 0) return -1;
-    c->slen = (size_t)alen;
-    c->soff = 0;
-    return 0;
-}
-
-static void conn_reset(Conn *c) {
-    if (c->fd >= 0) close(c->fd);
-    c->fd = -1;
-    c->state = CONN_ST_UNUSED;
-    c->rlen = 0;
-    c->slen = 0;
-    c->soff = 0;
-    c->want_read = 0;
-    c->want_write = 0;
-}
-
-static int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
-    return 0;
-}
-
-static int conn_start(Conn *c, unsigned int ip, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    if (set_nonblocking(fd) < 0) {
         close(fd);
-        return -1;
+        pthread_mutex_lock(&g_stat_lock);
+        g_auth_done++;
+        pthread_mutex_unlock(&g_stat_lock);
     }
 
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(ip);
-
-    int ret = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
-    if (ret < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-
-    c->fd = fd;
-    c->ip = ip;
-    c->port = port;
-    c->phase = 0;
-    c->cred_idx = -1;
-    c->start_ts = now_sec();
-    c->last_io_ts = c->start_ts;
-    c->rlen = 0;
-    if (conn_prepare_hello(c) < 0) {
-        close(fd);
-        return -1;
-    }
-    c->want_read = 0;
-    c->want_write = 0;
-
-    if (ret == 0) {
-        c->state = CONN_ST_PROBE_SEND;
+    /* 被 g_stop 中断时补齐剩余计数 */
+    if (attempted < total) {
+        pthread_mutex_lock(&g_stat_lock);
+        g_auth_done += (total - attempted);
+        pthread_mutex_unlock(&g_stat_lock);
     } else {
-        c->state = CONN_ST_CONNECTING;
+        /* 所有凭证都尝试完了且全部失败 */
+        report_hit(ip, port, "Socks5 (需要认证但测试凭证无效)");
     }
+}
+
+/* ======================== 蜜罐快速检测 ======================== */
+
+/*
+ * 对无认证的 SOCKS5 代理做一次 CONNECT 验证
+ * 尝试通过代理连接 1.1.1.1:80 并发送 HTTP HEAD 请求
+ * 返回: 1=可用代理, 0=蜜罐/不可用
+ */
+static int verify_proxy(int fd, double timeout) {
+    /* SOCKS5 CONNECT 请求到 1.1.1.1:80 */
+    unsigned char connect_req[] = {
+        0x05, 0x01,                   /* VER, CMD=CONNECT */
+        0x00,                         /* RSV */
+        0x01,                         /* ATYP=IPv4 */
+        0x01, 0x01, 0x01, 0x01,       /* 1.1.1.1 */
+        0x00, 0x50                    /* port 80 */
+    };
+    /*
+     * CONNECT 响应最少 10 字节 (VER+REP+RSV+ATYP+ADDR+PORT)
+     * 但某些代理返回域名类型 (ATYP=3)，响应会更长，
+     * 用更大的缓冲区接收以避免截断
+     */
+    unsigned char connect_resp[262] = {0};
+    int n = sock_send_recv(fd, connect_req, sizeof(connect_req),
+                           connect_resp, sizeof(connect_resp), timeout);
+
+    if (n < 4 || connect_resp[0] != 0x05 || connect_resp[1] != 0x00) {
+        return 0; /* CONNECT 失败 */
+    }
+
+    /* CONNECT 成功，发一个 HTTP HEAD 请求验证连通性 */
+    const char *http_req = "HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
+    unsigned char http_resp[512] = {0};
+    n = sock_send_recv(fd, (const unsigned char *)http_req,
+                       (int)strlen(http_req), http_resp, sizeof(http_resp) - 1, timeout);
+
+    if (n > 0 && (strstr((char *)http_resp, "HTTP/") != NULL)) {
+        return 1; /* 真实可用代理 */
+    }
+
     return 0;
 }
 
-static void conn_finish(int kq, Conn *c, int success) {
-    (void)success;
-    kq_update_conn_events(kq, c, 0, 0);
-    conn_reset(c);
-}
+/* ======================== Worker线程 ======================== */
 
-static void conn_auth_finalize(Conn *c, int report_invalid) {
-    if (g_creds.count == 0) return;
-    if (c->cred_idx < 0) return;
-    if ((size_t)c->cred_idx >= g_creds.count) return;
-    stats_add_done(g_creds.count - (size_t)c->cred_idx,
-                   g_creds.count - (size_t)c->cred_idx);
-    if (report_invalid) {
-        report_hit(c->ip, c->port, "Socks5 (需要认证但测试凭证无效)");
-    }
-}
+static TaskQueue g_queue;
+static double g_timeout = 5.0;
 
-static int next_target(IpIter *it, PortList *ports, unsigned int *cur_ip,
-                       size_t *port_idx, int *has_ip,
-                       unsigned int *ip_out, int *port_out) {
-    if (!*has_ip || ports->count == 0) return 0;
-    *ip_out = *cur_ip;
-    *port_out = ports->ports[*port_idx];
-    (*port_idx)++;
-    if (*port_idx >= ports->count) {
-        *port_idx = 0;
-        *has_ip = iptok_next(it, cur_ip);
-    }
-    return 1;
-}
+static void *worker_main(void *arg) {
+    (void)arg;
+    Task t;
+    while (!g_stop && tq_pop(&g_queue, &t) == 0) {
+        if (g_stop) break;
 
-static void run_kqueue_probe(IpList *iplist, PortList *ports, size_t max_active) {
-    int kq = kq_init();
-    if (kq < 0) {
-        fprintf(stderr, "[!] kqueue init failed: %s\n", strerror(errno));
-        return;
-    }
+        int fd = connect_with_timeout(t.ip, t.port, g_timeout);
+        if (fd < 0) {
+            pthread_mutex_lock(&g_stat_lock);
+            g_done_tasks++;
+            pthread_mutex_unlock(&g_stat_lock);
+            continue;
+        }
 
-    Conn *conns = calloc(max_active, sizeof(Conn));
-    if (!conns) {
-        fprintf(stderr, "[!] alloc conns failed\n");
-        close(kq);
-        return;
-    }
-    for (size_t i = 0; i < max_active; i++) {
-        conns[i].fd = -1;
-        conns[i].state = CONN_ST_UNUSED;
-    }
+        /*
+         * 探测握手: 同时提供 NO AUTH (0x00) 和 USER/PASS (0x02)
+         * 这样无论服务器支持哪种认证，都能正确识别
+         */
+        unsigned char req[4] = {0x05, 0x02, 0x00, 0x02};
+        unsigned char resp[2] = {0};
+        int n = sock_send_recv(fd, req, 4, resp, 2, g_timeout);
 
-    IpIter it;
-    iptok_init_iter(&it, iplist);
-    unsigned int cur_ip = 0;
-    int has_ip = iptok_next(&it, &cur_ip);
-    size_t port_idx = 0;
-    size_t active = 0;
-    double last_progress = 0;
-
-    while (!g_stop && (active > 0 || has_ip)) {
-        while (!g_stop && active < max_active) {
-            unsigned int ip;
-            int port;
-            if (!next_target(&it, ports, &cur_ip, &port_idx, &has_ip, &ip, &port))
-                break;
-
-            Conn *slot = NULL;
-            for (size_t i = 0; i < max_active; i++) {
-                if (conns[i].state == CONN_ST_UNUSED) {
-                    slot = &conns[i];
-                    break;
+        if (n == 2 && resp[0] == 0x05) {
+            if (resp[1] == 0x00) {
+                /* 无需认证 — 做一次代理可用性验证 */
+                if (verify_proxy(fd, g_timeout)) {
+                    report_hit(t.ip, t.port, "Socks5 (已验证)");
                 }
-            }
-            if (!slot) break;
-
-            if (conn_start(slot, ip, port) < 0) {
-                g_done_tasks++;
-                continue;
-            }
-
-            active++;
-            if (slot->state == CONN_ST_CONNECTING || slot->state == CONN_ST_PROBE_SEND) {
-                kq_update_conn_events(kq, slot, 0, 1);
-            }
-        }
-
-        struct kevent events[64];
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 100000000;
-
-        int nev = kevent(kq, NULL, 0, events, (int)(sizeof(events) / sizeof(events[0])), &ts);
-        if (nev < 0 && errno != EINTR) {
-            fprintf(stderr, "[!] kevent error: %s\n", strerror(errno));
-            break;
-        }
-
-        for (int i = 0; i < nev; i++) {
-            Conn *c = (Conn *)events[i].udata;
-            if (!c || c->state == CONN_ST_UNUSED) continue;
-
-            if (events[i].flags & (EV_ERROR | EV_EOF)) {
-                if (c->cred_idx >= 0) {
-                    conn_auth_finalize(c, 0);
+                /* 验证失败的不报告，避免蜂罐和无效代理污染结果 */
+            } else if (resp[1] == 0x02) {
+                /* 需要用户名/密码认证 — 在当前线程内直接完成 */
+                close(fd);
+                fd = -1; /* 标记已关闭 */
+                if (g_creds.count > 0) {
+                    try_auth_in_place(t.ip, t.port, g_timeout);
                 } else {
-                    stats_add_done(1, 0);
+                    report_hit(t.ip, t.port, "Socks5 (需要认证但无可用测试凭证)");
                 }
-                conn_finish(kq, c, 0);
-                active--;
-                continue;
-            }
-
-            if (events[i].filter == EVFILT_WRITE) {
-                if (c->state == CONN_ST_CONNECTING) {
-                    int err = 0;
-                    socklen_t elen = sizeof(err);
-                    if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
-                        stats_add_done(1, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                        continue;
-                    }
-                    c->state = CONN_ST_PROBE_SEND;
-                }
-
-                if (c->state == CONN_ST_PROBE_SEND) {
-                    ssize_t n = send(c->fd, c->sbuf + c->soff, c->slen - c->soff, 0);
-                    if (n > 0) {
-                        c->soff += (size_t)n;
-                        c->last_io_ts = now_sec();
-                        if (c->soff >= c->slen) {
-                            c->state = CONN_ST_PROBE_RECV;
-                            c->rlen = 0;
-                            kq_update_conn_events(kq, c, 1, 0);
-                        }
-                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        stats_add_done(1, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    }
-                } else if (c->state == CONN_ST_AUTH_SEND) {
-                    ssize_t n = send(c->fd, c->sbuf + c->soff, c->slen - c->soff, 0);
-                    if (n > 0) {
-                        c->soff += (size_t)n;
-                        c->last_io_ts = now_sec();
-                        if (c->soff >= c->slen) {
-                            c->state = CONN_ST_AUTH_RECV;
-                            c->rlen = 0;
-                            kq_update_conn_events(kq, c, 1, 0);
-                        }
-                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        conn_auth_finalize(c, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    }
-                }
-            } else if (events[i].filter == EVFILT_READ) {
-                if (c->state == CONN_ST_PROBE_RECV) {
-                    ssize_t n = recv(c->fd, c->rbuf + c->rlen, 2 - c->rlen, 0);
-                    if (n > 0) {
-                        c->rlen += (size_t)n;
-                        c->last_io_ts = now_sec();
-                        if (c->rlen >= 2) {
-                            int finish_conn = 1;
-                            if (c->rbuf[0] == 0x05) {
-                                if (c->rbuf[1] == 0x00) {
-                                    report_hit(c->ip, c->port, "Socks5 (无需认证)");
-                                } else if (c->rbuf[1] == 0x02) {
-                                    if (g_creds.count > 0) {
-                                        stats_add_auth_total(g_creds.count);
-                                        c->cred_idx = 0;
-                                        if (conn_prepare_auth_payload(c, &g_creds.items[c->cred_idx]) < 0) {
-                                            conn_auth_finalize(c, 1);
-                                            conn_finish(kq, c, 0);
-                                            active--;
-                                            finish_conn = 0;
-                                            break;
-                                        }
-                                        c->state = CONN_ST_AUTH_SEND;
-                                        c->rlen = 0;
-                                        finish_conn = 0;
-                                        kq_update_conn_events(kq, c, 0, 1);
-                                    } else {
-                                        report_hit(c->ip, c->port, "Socks5 (需要认证但无可用测试凭证)");
-                                    }
-                                } else if (c->rbuf[1] == 0xFF) {
-                                    /* no acceptable method */
-                                } else {
-                                    char info[128];
-                                    snprintf(info, sizeof(info), "Socks5 (未知认证方式: 0x%02x)", c->rbuf[1]);
-                                    report_hit(c->ip, c->port, info);
-                                }
-                            }
-
-                            stats_add_done(1, 0);
-                            if (finish_conn) {
-                                conn_finish(kq, c, 1);
-                                active--;
-                            }
-                        }
-                    } else if (n == 0) {
-                        stats_add_done(1, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        stats_add_done(1, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    }
-                } else if (c->state == CONN_ST_AUTH_RECV) {
-                    ssize_t n = recv(c->fd, c->rbuf + c->rlen, 2 - c->rlen, 0);
-                    if (n > 0) {
-                        c->rlen += (size_t)n;
-                        c->last_io_ts = now_sec();
-                        if (c->rlen >= 2) {
-                            if (c->rbuf[0] == 0x01 && c->rbuf[1] == 0x00) {
-                                char info[256];
-                                Cred *cred = &g_creds.items[c->cred_idx];
-                                snprintf(info, sizeof(info), "Socks5 (认证成功: %s:%s)", cred->user, cred->pass);
-                                report_hit(c->ip, c->port, info);
-                                stats_add_done(g_creds.count - (size_t)c->cred_idx,
-                                               g_creds.count - (size_t)c->cred_idx);
-                                conn_finish(kq, c, 1);
-                                active--;
-                            } else {
-                                stats_add_done(1, 1);
-                                if ((size_t)c->cred_idx + 1 < g_creds.count) {
-                                    c->cred_idx++;
-                                    if (conn_prepare_auth_payload(c, &g_creds.items[c->cred_idx]) < 0) {
-                                        conn_auth_finalize(c, 1);
-                                        conn_finish(kq, c, 0);
-                                        active--;
-                                        break;
-                                    }
-                                    c->state = CONN_ST_AUTH_SEND;
-                                    c->rlen = 0;
-                                    kq_update_conn_events(kq, c, 0, 1);
-                                } else {
-                                    report_hit(c->ip, c->port, "Socks5 (需要认证但测试凭证无效)");
-                                    conn_finish(kq, c, 0);
-                                    active--;
-                                }
-                            }
-                        }
-                    } else if (n == 0) {
-                        conn_auth_finalize(c, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        conn_auth_finalize(c, 0);
-                        conn_finish(kq, c, 0);
-                        active--;
-                    }
-                }
-            }
-        }
-
-        double now = now_sec();
-        for (size_t i = 0; i < max_active; i++) {
-            Conn *c = &conns[i];
-            if (c->state == CONN_ST_UNUSED) continue;
-            if (now - c->last_io_ts <= g_timeout) continue;
-            if (c->cred_idx >= 0) {
-                conn_auth_finalize(c, 0);
+            } else if (resp[1] == 0xFF) {
+                /* 不接受提供的任何方法 — 不报告 */
             } else {
-                stats_add_done(1, 0);
+                char info[128];
+                snprintf(info, sizeof(info), "Socks5 (未知认证方式: 0x%02x)", resp[1]);
+                report_hit(t.ip, t.port, info);
             }
-            conn_finish(kq, c, 0);
-            if (active > 0) active--;
         }
-        if (now - last_progress >= 0.5) {
-            print_progress();
-            last_progress = now;
-        }
-    }
 
-    for (size_t i = 0; i < max_active; i++) {
-        if (conns[i].state != CONN_ST_UNUSED) {
-            conn_finish(kq, &conns[i], 0);
-        }
-    }
+        if (fd >= 0) close(fd);
 
-    free(conns);
-    close(kq);
+        pthread_mutex_lock(&g_stat_lock);
+        g_done_tasks++;
+        pthread_mutex_unlock(&g_stat_lock);
+    }
+    return NULL;
 }
 
 /* ======================== 主函数 ======================== */
@@ -624,118 +728,107 @@ static void run_kqueue_probe(IpList *iplist, PortList *ports, size_t max_active)
 static void print_banner(void) {
     puts("\n============================================================");
     puts("   _____  ____  __  __ ____  _____  _______     _______ ______ _      _____ ");
-    puts("  / ____|/ __ \|  \/  |  _ \|  __ \|  __ \ \   / / ____|  ____| |    |_   _|");
-    puts(" | (___ | |  | | \  / | |_) | |__) | |__) \ \_/ / |  __| |__  | |      | |  ");
-    puts("  \___ \| |  | | |\/| |  _ <|  _  /|  ___/ \   /| | |_ |  __| | |      | |  ");
-    puts("  ____) | |__| | |  | | |_) | | \ \| |      | | | |__| | |____| |____ _| |_ ");
-    puts(" |_____/ \____/|_|  |_|____/|_|  \_\_|      |_|  \_____|______|______|_____|");
-    puts("  Socks代理扫描工具 v3.5 | 交互式模式 | 支持用户名/密码认证测试");
+    puts("  / ____|/ __ \\|  \\/  |  _ \\|  __ \\|  __ \\ \\   / / ____|  ____| |    |_   _|");
+    puts(" | (___ | |  | | \\  / | |_) | |__) | |__) \\ \\_/ / |  __| |__  | |      | |  ");
+    puts("  \\___ \\| |  | | |\\/| |  _ <|  _  /|  ___/ \\   /| | |_ |  __| | |      | |  ");
+    puts("  ____) | |__| | |  | | |_) | | \\ \\| |      | | | |__| | |____| |____ _| |_ ");
+    puts(" |_____/ \\____/|_|  |_|____/|_|  \\_\\_|      |_|  \\_____|______|______|_____|");
+    puts("  Socks代理扫描工具 v4.0 | 命令行+交互式 | 支持代理验证");
     puts("============================================================\n");
 }
 
-int main(int argc, char **argv) {
+static void print_usage(const char *prog) {
+    printf("用法: %s [选项]\n", prog);
+    puts("  -i <IP/文件>      IP地址范围或包含IP列表的文件 (默认: check.txt)");
+    puts("  -p <端口>         端口范围 (默认: 1080)");
+    puts("  -c <凭证文件>     凭证文件路径 (默认: credentials.txt)");
+    puts("  -t <线程数>       并发线程数 (默认: 100)");
+    puts("  -T <超时>         连接超时时间/秒 (默认: 5)");
+    puts("  -o <输出文件>     结果输出文件 (默认: socks.txt)");
+    puts("  -h                显示此帮助信息");
+    puts("\n示例:");
+    puts("  ./socks5 -i 192.168.1.0/24 -p 1080,8080 -t 50 -T 3 -o result.txt");
+    puts("  ./socks5 -i check.txt -c creds.txt");
+    puts("  ./socks5  (交互式模式)");
+}
+
+int main(int argc, char *argv[]) {
     signal(SIGINT, on_sigint);
+    signal(SIGPIPE, SIG_IGN); /* 忽略 SIGPIPE，避免写入已关闭的 socket 时崩溃 */
 
-    size_t kq_concurrency = DEFAULT_KQUEUE_CONCURRENCY;
+    char *ip_input = NULL;
+    char *port_input = NULL;
+    char *cred_input = NULL;
+    char *thread_input = NULL;
+    char *timeout_input = NULL;
+    char *output_input = NULL;
+    int interactive = 1;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-C") == 0 || strcmp(argv[i], "--concurrency") == 0) {
-            if (i + 1 < argc) {
-                char *endp = NULL;
-                long val = strtol(argv[++i], &endp, 10);
-                if (endp && *endp == '\0' && val > 0) {
-                    kq_concurrency = (size_t)val;
-                } else {
-                    fprintf(stderr, "[!] invalid concurrency value, using default %d\n",
-                            DEFAULT_KQUEUE_CONCURRENCY);
-                }
-            } else {
-                fprintf(stderr, "[!] missing value for --concurrency, using default %d\n",
-                        DEFAULT_KQUEUE_CONCURRENCY);
-            }
-        } else if (strncmp(argv[i], "--concurrency=", 14) == 0) {
-            char *valstr = argv[i] + 14;
-            char *endp = NULL;
-            long val = strtol(valstr, &endp, 10);
-            if (endp && *endp == '\0' && val > 0) {
-                kq_concurrency = (size_t)val;
-            } else {
-                fprintf(stderr, "[!] invalid concurrency value, using default %d\n",
-                        DEFAULT_KQUEUE_CONCURRENCY);
-            }
-        } else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--timeout") == 0) {
-            if (i + 1 < argc) {
-                char *endp = NULL;
-                double val = strtod(argv[++i], &endp);
-                if (endp && *endp == '\0' && val > 0) {
-                    g_timeout = val;
-                } else {
-                    fprintf(stderr, "[!] invalid timeout value, using default %s\n",
-                            DEFAULT_TIMEOUT);
-                    g_timeout = strtod(DEFAULT_TIMEOUT, NULL);
-                }
-            } else {
-                fprintf(stderr, "[!] missing value for --timeout, using default %s\n",
-                        DEFAULT_TIMEOUT);
-                g_timeout = strtod(DEFAULT_TIMEOUT, NULL);
-            }
-        } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
-            char *valstr = argv[i] + 10;
-            char *endp = NULL;
-            double val = strtod(valstr, &endp);
-            if (endp && *endp == '\0' && val > 0) {
-                g_timeout = val;
-            } else {
-                fprintf(stderr, "[!] invalid timeout value, using default %s\n",
-                        DEFAULT_TIMEOUT);
-                g_timeout = strtod(DEFAULT_TIMEOUT, NULL);
-            }
+    /* 命令行参数解析 */
+    int opt;
+    while ((opt = getopt(argc, argv, "i:p:c:t:T:o:h")) != -1) {
+        interactive = 0;
+        switch (opt) {
+            case 'i': ip_input = strdup(optarg); break;
+            case 'p': port_input = strdup(optarg); break;
+            case 'c': cred_input = strdup(optarg); break;
+            case 't': thread_input = strdup(optarg); break;
+            case 'T': timeout_input = strdup(optarg); break;
+            case 'o': output_input = strdup(optarg); break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
         }
     }
 
     print_banner();
 
-    /* 提示信息 */
-    puts("提示:");
-    puts("- 按回车键使用默认值");
-    puts("- IP地址范围支持: 单个IP, CIDR格式 (192.168.0.0/24), IP范围 (192.168.0.1-192.168.0.100)");
-    puts("- 或者直接输入包含IP列表的文件路径");
-    puts("- 凭证文件格式: 每行 username password / username:password\n");
+    if (interactive) {
+        /* 交互式输入 */
+        puts("提示:");
+        puts("- 按回车键使用默认值");
+        puts("- IP地址范围支持: 单个IP, CIDR格式 (192.168.0.0/24), IP范围 (192.168.0.1-192.168.0.100)");
+        puts("- 或者直接输入包含IP列表的文件路径");
+        puts("- 凭证文件格式: 每行 username password / username:password\n");
 
-    /* 交互式输入 */
-    char *ip_input   = get_input("IP地址范围(或文件路径)", DEFAULT_CHECK);
-    char *port_input  = get_input("端口范围", DEFAULT_PORT);
-    char *cred_input  = get_input("凭证文件路径", DEFAULT_CRED_FILE);
-    char timeout_default[32];
-    snprintf(timeout_default, sizeof(timeout_default), "%.2f", g_timeout);
-    char *timeout_input = get_input("连接超时时间(秒)", timeout_default);
-    char concurrency_default[32];
-    snprintf(concurrency_default, sizeof(concurrency_default), "%zu", kq_concurrency);
-    char *concurrency_input = get_input("并发连接数", concurrency_default);
-    char *output_input = get_input("结果输出文件", DEFAULT_OUTPUT);
-
-    /* 解析并发连接数 */
-    {
-        char *endp = NULL;
-        long val = strtol(concurrency_input, &endp, 10);
-        if (endp && *endp == '\0' && val > 0) {
-            kq_concurrency = (size_t)val;
-        } else {
-            fprintf(stderr, "[!] 无效的并发连接数，使用默认值 (%d)\n",
-                    DEFAULT_KQUEUE_CONCURRENCY);
-            kq_concurrency = DEFAULT_KQUEUE_CONCURRENCY;
-        }
+        ip_input      = get_input("IP地址范围(或文件路径)", DEFAULT_CHECK);
+        port_input    = get_input("端口范围", DEFAULT_PORT);
+        cred_input    = get_input("凭证文件路径", DEFAULT_CRED_FILE);
+        thread_input  = get_input("并发线程数", DEFAULT_THREADS);
+        timeout_input = get_input("连接超时时间(秒)", DEFAULT_TIMEOUT);
+        output_input  = get_input("结果输出文件", DEFAULT_OUTPUT);
+    } else {
+        /* 填充默认值 */
+        if (!ip_input)      ip_input = strdup(DEFAULT_CHECK);
+        if (!port_input)    port_input = strdup(DEFAULT_PORT);
+        if (!cred_input)    cred_input = strdup(DEFAULT_CRED_FILE);
+        if (!thread_input)  thread_input = strdup(DEFAULT_THREADS);
+        if (!timeout_input) timeout_input = strdup(DEFAULT_TIMEOUT);
+        if (!output_input)  output_input = strdup(DEFAULT_OUTPUT);
     }
 
-    /* 解析超时 */
-    {
-        char *endp = NULL;
-        double val = strtod(timeout_input, &endp);
-        if (endp && *endp == '\0' && val > 0) {
-            g_timeout = val;
-        } else {
-            fprintf(stderr, "[!] 无效的超时时间，使用默认值 (%s)\n", DEFAULT_TIMEOUT);
-            g_timeout = strtod(DEFAULT_TIMEOUT, NULL);
+    /* 解析线程数和超时 */
+    long nthreads = strtol(thread_input, NULL, 10);
+    g_timeout = strtod(timeout_input, NULL);
+    if (nthreads <= 0 || g_timeout <= 0) {
+        fprintf(stderr, "[!] 无效的线程数或超时时间，使用默认值 (线程=%s, 超时=%s)\n",
+                DEFAULT_THREADS, DEFAULT_TIMEOUT);
+        nthreads = strtol(DEFAULT_THREADS, NULL, 10);
+        g_timeout = strtod(DEFAULT_TIMEOUT, NULL);
+    }
+
+    /* 检查文件描述符限制，自动调整线程数 */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        long max_safe = (long)(rl.rlim_cur * 0.7); /* 留 30% 余量 */
+        if (max_safe < 10) max_safe = 10;
+        if (nthreads > max_safe) {
+            printf("[!] 文件描述符限制 %llu，自动调整线程数: %ld -> %ld\n",
+                   (unsigned long long)rl.rlim_cur, nthreads, max_safe);
+            nthreads = max_safe;
         }
     }
 
@@ -753,7 +846,7 @@ int main(int argc, char **argv) {
         add_cred(&g_creds, "admin", "pass");
         add_cred(&g_creds, "user", "pass");
     }
-    printf("[*] 已加载凭证: %zu组 | 可用于测试: %zu组\n", g_creds.count, g_creds.count);
+    printf("[*] 已加载凭证: %zu组\n", g_creds.count);
 
     /* 解析端口 */
     PortList ports = parse_ports(port_input);
@@ -804,8 +897,8 @@ int main(int argc, char **argv) {
     g_total_tasks = ip_count * ports.count;
     printf("[*] 端口探测目标: %llu个IP地址, %zu个端口, 共%llu个组合\n",
            ip_count, ports.count, g_total_tasks);
-    puts("[*] 策略: 先做端口/SOCKS5握手探测, 仅对可达且要求认证的端口逐个尝试用户名密码");
-    printf("[*] 并发连接: %zu, 超时: %.2f秒\n", kq_concurrency, g_timeout);
+    puts("[*] 策略: SOCKS5握手探测 -> 无认证代理验证连通性 -> 认证代理在线程内直接尝试凭证");
+    printf("[*] 使用线程: %ld, 超时: %.2f秒\n", nthreads, g_timeout);
 
     /* 打开输出文件 */
     g_outfp = fopen(output_input, "w");
@@ -814,22 +907,52 @@ int main(int argc, char **argv) {
                 output_input, strerror(errno));
     }
 
+    /* 初始化任务队列 */
+    size_t qcap = (size_t)(nthreads * 4);
+    if (qcap < 1024) qcap = 1024;
+    if (tq_init(&g_queue, qcap) < 0) {
+        puts("[!] 初始化任务队列失败");
+        return 1;
+    }
+
     puts("[*] 开始扫描...");
     g_start_time = now_sec();
 
-    {
-        size_t max_active = kq_concurrency;
-        if (max_active < 1) max_active = 1;
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-            rlim_t need = (rlim_t)(kq_concurrency + KQUEUE_RLIMIT_MARGIN);
-            if (rl.rlim_cur < need) {
-                fprintf(stderr,
-                        "[!] warning: RLIMIT_NOFILE soft=%llu < concurrency+margin (%zu+%d)\n",
-                        (unsigned long long)rl.rlim_cur, kq_concurrency, KQUEUE_RLIMIT_MARGIN);
+    /* 创建工作线程 */
+    pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
+    if (!threads) {
+        puts("[!] 分配线程资源失败");
+        return 1;
+    }
+    for (long i = 0; i < nthreads; i++) {
+        pthread_create(&threads[i], NULL, worker_main, NULL);
+    }
+
+    /* 生产者: 枚举所有IP:Port组合 */
+    IpIter it;
+    iptok_init_iter(&it, &iplist);
+    unsigned int cur_ip;
+    unsigned long long enqueued = 0;
+    double last_progress = 0;
+
+    while (!g_stop && iptok_next(&it, &cur_ip)) {
+        for (size_t pi = 0; pi < ports.count && !g_stop; pi++) {
+            queue_task(&g_queue, cur_ip, ports.ports[pi]);
+            enqueued++;
+            double now = now_sec();
+            if (now - last_progress >= 2.0) { /* 每2秒刷新进度 */
+                print_progress();
+                last_progress = now;
             }
         }
-        run_kqueue_probe(&iplist, &ports, max_active);
+    }
+
+    /* 关闭队列 */
+    maybe_close_queue(&g_queue);
+
+    /* 等待所有线程完成 */
+    for (long i = 0; i < nthreads; i++) {
+        pthread_join(threads[i], NULL);
     }
 
     print_progress();
@@ -837,7 +960,8 @@ int main(int argc, char **argv) {
 
     double elapsed = now_sec() - g_start_time;
     printf("[*] 扫描完成! 用时: %.2f秒\n", elapsed);
-    printf("[*] 扫描目标: %llu个, 发现代理: %llu个\n", g_total_tasks, g_found);
+    printf("[*] 扫描目标: %llu个, 认证尝试: %llu个, 发现代理: %llu个\n",
+           g_total_tasks, g_auth_total, g_found);
 
     /* 保存结果 */
     if (g_outfp) {
@@ -856,18 +980,17 @@ int main(int argc, char **argv) {
     }
 
     /* 清理 */
+    free(threads);
+    tq_destroy(&g_queue);
     free_creds(&g_creds);
-    iplist_free(&iplist);
-    portlist_free(&ports);
+    free(iplist.ranges);
+    free(ports.ports);
     free(ip_input);
     free(port_input);
     free(cred_input);
+    free(thread_input);
     free(timeout_input);
-    free(concurrency_input);
     free(output_input);
-
-    puts("\n按回车键退出...");
-    getc(stdin);
 
     return 0;
 }

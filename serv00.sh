@@ -1,28 +1,26 @@
 #!/bin/bash
 # ============================================================
 #  S5 Proxy Scanner - SERV00 一键安装管理脚本
-#  用法: bash <(curl -Ls https://raw.githubusercontent.com/Ioveo/88u/main/serv00.sh)
+#  用法: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/serv00.sh)
+#  安装后: 输入 kk 即可启动管理菜单
 # ============================================================
-
-# set -e 会导致 confirm 返回 1 时整个脚本退出，不使用
 
 # ======================== 配置 ========================
 INSTALL_DIR="$HOME/socks5"
 BIN_NAME="socks5"
 SRC_NAME="socks5.c"
+SCRIPT_NAME="serv00.sh"
 IP_FILE="$INSTALL_DIR/check.txt"
 CRED_FILE="$INSTALL_DIR/credentials.txt"
 OUTPUT_FILE="$INSTALL_DIR/socks.txt"
 LOG_FILE="$INSTALL_DIR/scan.log"
 PID_FILE="$INSTALL_DIR/.scan.pid"
+KK_PATH="$HOME/bin/kk"
 
-# GitHub 源码地址
-GITHUB_RAW="https://raw.githubusercontent.com/Ioveo/88u/main"
-SRC_URL="$GITHUB_RAW/socks5.c"
-PARSE_URL="$GITHUB_RAW/src/parse.c"
-PROTO_URL="$GITHUB_RAW/src/socks5_proto.c"
-PARSE_H_URL="$GITHUB_RAW/include/parse.h"
-PROTO_H_URL="$GITHUB_RAW/include/socks5_proto.h"
+# GitHub 源码地址 (修改为你的仓库地址)
+GITHUB_RAW="https://raw.githubusercontent.com/你的用户名/你的仓库/main"
+SRC_URL="${GITHUB_RAW}/socks5.c"
+SCRIPT_URL="${GITHUB_RAW}/serv00.sh"
 
 # ======================== 颜色 ========================
 RED='\033[0;31m'
@@ -31,7 +29,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 BOLD='\033[1m'
 
 # ======================== 工具函数 ========================
@@ -51,74 +49,170 @@ confirm() {
     case "$yn" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
-# 确保安装目录存在
 ensure_dir() {
     [ -d "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR"
 }
 
+# ======================== 下载工具 ========================
+
 download_file() {
-    local url="$1"
-    local out="$2"
+    local url="$1" dest="$2"
     if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$out"
+        curl -fsSL "$url" -o "$dest"
     elif command -v wget &>/dev/null; then
-        wget -qO "$out" "$url"
+        wget -qO "$dest" "$url"
     elif command -v fetch &>/dev/null; then
-        fetch -qo "$out" "$url"
+        fetch -qo "$dest" "$url"
     else
         error "找不到 curl/wget/fetch, 无法下载"; return 1
     fi
 }
 
-# ======================== 安装/更新 ========================
+# ======================== 安装 ========================
 
-install_or_update() {
-    title "安装 / 更新 S5 Scanner"
+do_install() {
+    title "安装 S5 Scanner"
     ensure_dir
 
-    info "下载源码..."
-    mkdir -p "$INSTALL_DIR/src" "$INSTALL_DIR/include"
+    # 1. 下载源码
+    info "下载源码 socks5.c ..."
+    if ! download_file "$SRC_URL" "$INSTALL_DIR/$SRC_NAME"; then
+        error "下载源码失败"; return 1
+    fi
+    info "源码已保存"
 
-    download_file "$SRC_URL" "$INSTALL_DIR/$SRC_NAME" || return 1
-    download_file "$PARSE_URL" "$INSTALL_DIR/src/parse.c" || return 1
-    download_file "$PROTO_URL" "$INSTALL_DIR/src/socks5_proto.c" || return 1
-    download_file "$PARSE_H_URL" "$INSTALL_DIR/include/parse.h" || return 1
-    download_file "$PROTO_H_URL" "$INSTALL_DIR/include/socks5_proto.h" || return 1
+    # 2. 下载脚本自身
+    info "下载管理脚本 serv00.sh ..."
+    if ! download_file "$SCRIPT_URL" "$INSTALL_DIR/$SCRIPT_NAME"; then
+        error "下载脚本失败"; return 1
+    fi
+    chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+    info "脚本已保存"
 
-    info "源码已保存至 $INSTALL_DIR"
-
+    # 3. 编译
     info "编译中..."
-    cd "$INSTALL_DIR" || return 1
-    if cc -o "$BIN_NAME" "$SRC_NAME" src/parse.c src/socks5_proto.c 2>/dev/null; then
+    cd "$INSTALL_DIR"
+    if cc -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
         info "编译成功: $INSTALL_DIR/$BIN_NAME"
-    elif gcc -o "$BIN_NAME" "$SRC_NAME" src/parse.c src/socks5_proto.c 2>/dev/null; then
-        info "编译成功 (gcc): $INSTALL_DIR/$BIN_NAME"
-    elif clang -o "$BIN_NAME" "$SRC_NAME" src/parse.c src/socks5_proto.c 2>/dev/null; then
-        info "编译成功 (clang): $INSTALL_DIR/$BIN_NAME"
+    elif gcc -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
+        info "编译成功 (gcc)"
+    elif clang -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
+        info "编译成功 (clang)"
     else
-        error "编译失败! 请检查编译器是否安装"
+        error "编译失败! 请检查编译器是否可用"
         return 1
     fi
     chmod +x "$INSTALL_DIR/$BIN_NAME"
 
-    # 创建默认文件
+    # 4. 创建默认文件
     [ -f "$IP_FILE" ]   || touch "$IP_FILE"
     [ -f "$CRED_FILE" ] || touch "$CRED_FILE"
 
-    info "安装完成!"
-}
+    # 5. 创建 kk 快捷命令
+    mkdir -p "$HOME/bin"
+    cat > "$KK_PATH" << 'KEOF'
+#!/bin/bash
+exec bash "$HOME/socks5/serv00.sh" --manage
+KEOF
+    chmod +x "$KK_PATH"
 
-check_installed() {
-    if [ ! -f "$INSTALL_DIR/$BIN_NAME" ]; then
-        warn "S5 Scanner 尚未安装"
-        if confirm "是否立即安装?"; then
-            install_or_update
-        else
-            return 1
+    # 6. 确保 ~/bin 在 PATH 中
+    local shell_rc=""
+    if [ -f "$HOME/.bashrc" ]; then
+        shell_rc="$HOME/.bashrc"
+    elif [ -f "$HOME/.profile" ]; then
+        shell_rc="$HOME/.profile"
+    elif [ -f "$HOME/.bash_profile" ]; then
+        shell_rc="$HOME/.bash_profile"
+    fi
+
+    if [ -n "$shell_rc" ]; then
+        if ! grep -q 'HOME/bin' "$shell_rc" 2>/dev/null; then
+            echo '' >> "$shell_rc"
+            echo '# S5 Scanner - kk 快捷命令' >> "$shell_rc"
+            echo 'export PATH="$HOME/bin:$PATH"' >> "$shell_rc"
+            info "已将 ~/bin 添加到 PATH ($shell_rc)"
         fi
     fi
-    return 0
+
+    # 临时生效
+    export PATH="$HOME/bin:$PATH"
+
+    echo ""
+    echo -e "${GREEN}${BOLD}╔══════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║       安装完成!                      ║${NC}"
+    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${WHITE}输入 ${GREEN}${BOLD}kk${NC} ${WHITE}即可启动管理菜单${NC}"
+    echo -e "  ${WHITE}如果 kk 命令未生效，请先执行:${NC}"
+    echo -e "  ${CYAN}source ~/.bashrc${NC}  ${WHITE}或${NC}  ${CYAN}source ~/.profile${NC}"
+    echo ""
 }
+
+# ======================== 卸载 ========================
+
+do_uninstall() {
+    title "卸载 S5 Scanner"
+
+    if [ ! -d "$INSTALL_DIR" ] && [ ! -f "$KK_PATH" ]; then
+        warn "S5 Scanner 未安装"
+        press_enter
+        return
+    fi
+
+    warn "将删除以下内容:"
+    [ -d "$INSTALL_DIR" ] && echo "  - 目录: $INSTALL_DIR"
+    [ -f "$KK_PATH" ] && echo "  - 命令: $KK_PATH"
+    echo ""
+
+    if ! confirm "确定要卸载?"; then return; fi
+
+    # 停止运行中的进程
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        kill "$pid" 2>/dev/null && info "已停止运行中的扫描 (PID: $pid)"
+    fi
+
+    rm -rf "$INSTALL_DIR"
+    rm -f "$KK_PATH"
+    info "卸载完成"
+    press_enter
+}
+
+# ======================== 安装/卸载入口菜单 ========================
+
+install_menu() {
+    clear 2>/dev/null || true
+    echo ""
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}    ${WHITE}${BOLD}S5 Proxy Scanner${NC}  ${BLUE}v4.0${NC}  ${WHITE}for SERV00${NC}          ${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 状态检测
+    if [ -f "$INSTALL_DIR/$BIN_NAME" ]; then
+        echo -e "  状态: ${GREEN}已安装${NC}"
+    else
+        echo -e "  状态: ${RED}未安装${NC}"
+    fi
+    echo ""
+    echo -e "  ${GREEN}1.${NC} 安装 / 更新"
+    echo -e "  ${GREEN}2.${NC} 卸载"
+    echo -e "  ${RED}0.${NC} 退出"
+    echo ""
+    read -rp "$(echo -e "${CYAN}请选择 [0-2]: ${NC}")" choice
+    case "$choice" in
+        1) do_install; press_enter ;;
+        2) do_uninstall ;;
+        0) echo -e "\n${GREEN}再见!${NC}\n"; exit 0 ;;
+        *) error "无效选择"; press_enter ;;
+    esac
+}
+
+# ================================================================
+#  以下为管理菜单 (通过 kk 命令调用)
+# ================================================================
 
 # ======================== IP 管理 ========================
 
@@ -146,12 +240,10 @@ add_ip() {
     echo "  多个(逗号): 1.2.3.4,5.6.7.8"
     echo ""
     echo -e "${YELLOW}输入 IP 地址/范围 (输入 q 返回):${NC}"
-
     while true; do
         read -rp "> " input
         [ "$input" = "q" ] || [ "$input" = "Q" ] && break
         [ -z "$input" ] && continue
-        ensure_dir
         echo "$input" >> "$IP_FILE"
         info "已添加: $input"
     done
@@ -161,7 +253,6 @@ import_ip_file() {
     title "从文件导入 IP"
     read -rp "$(echo -e "${WHITE}输入文件路径: ${NC}")" filepath
     if [ -f "$filepath" ]; then
-        ensure_dir
         cat "$filepath" >> "$IP_FILE"
         local count
         count=$(wc -l < "$filepath")
@@ -173,7 +264,6 @@ import_ip_file() {
 
 clear_ip() {
     if confirm "确定清空所有 IP 记录?"; then
-        ensure_dir
         : > "$IP_FILE"
         info "IP 列表已清空"
     fi
@@ -196,19 +286,12 @@ ip_menu() {
             3) import_ip_file; press_enter ;;
             4) clear_ip; press_enter ;;
             5)
-                ensure_dir
                 [ -f "$IP_FILE" ] || touch "$IP_FILE"
-                if command -v nano &>/dev/null; then
-                    nano "$IP_FILE"
-                elif command -v vi &>/dev/null; then
-                    vi "$IP_FILE"
-                elif command -v ee &>/dev/null; then
-                    ee "$IP_FILE"
-                else
-                    error "找不到编辑器 (nano/vi/ee)"
-                    press_enter
-                fi
-                ;;
+                if command -v nano &>/dev/null; then nano "$IP_FILE"
+                elif command -v vi &>/dev/null; then vi "$IP_FILE"
+                elif command -v ee &>/dev/null; then ee "$IP_FILE"
+                else error "找不到编辑器 (nano/vi/ee)"; press_enter
+                fi ;;
             0) return ;;
             *) error "无效选择" ;;
         esac
@@ -237,12 +320,10 @@ add_cred() {
     echo -e "${WHITE}示例: admin:123456${NC}"
     echo ""
     echo -e "${YELLOW}输入凭证 (输入 q 返回):${NC}"
-
     while true; do
         read -rp "> " input
         [ "$input" = "q" ] || [ "$input" = "Q" ] && break
         [ -z "$input" ] && continue
-        ensure_dir
         echo "$input" >> "$CRED_FILE"
         info "已添加: $input"
     done
@@ -250,23 +331,12 @@ add_cred() {
 
 add_common_creds() {
     title "添加常用凭证"
-    ensure_dir
     local creds=(
-        "admin:admin"
-        "admin:123456"
-        "admin:password"
-        "admin:123"
-        "admin:pass"
-        "root:root"
-        "root:123456"
-        "root:password"
-        "user:user"
-        "user:pass"
-        "user:123456"
-        "test:test"
-        "test:123456"
-        "proxy:proxy"
-        "socks:socks"
+        "admin:admin" "admin:123456" "admin:password" "admin:123" "admin:pass"
+        "root:root" "root:123456" "root:password"
+        "user:user" "user:pass" "user:123456"
+        "test:test" "test:123456"
+        "proxy:proxy" "socks:socks"
     )
     for c in "${creds[@]}"; do
         if ! grep -qF "$c" "$CRED_FILE" 2>/dev/null; then
@@ -278,7 +348,6 @@ add_common_creds() {
 
 clear_cred() {
     if confirm "确定清空所有凭证?"; then
-        ensure_dir
         : > "$CRED_FILE"
         info "凭证列表已清空"
     fi
@@ -301,38 +370,31 @@ cred_menu() {
             3) add_common_creds; press_enter ;;
             4) clear_cred; press_enter ;;
             5)
-                ensure_dir
                 [ -f "$CRED_FILE" ] || touch "$CRED_FILE"
-                if command -v nano &>/dev/null; then
-                    nano "$CRED_FILE"
-                elif command -v vi &>/dev/null; then
-                    vi "$CRED_FILE"
-                elif command -v ee &>/dev/null; then
-                    ee "$CRED_FILE"
-                else
-                    error "找不到编辑器 (nano/vi/ee)"
-                    press_enter
-                fi
-                ;;
+                if command -v nano &>/dev/null; then nano "$CRED_FILE"
+                elif command -v vi &>/dev/null; then vi "$CRED_FILE"
+                elif command -v ee &>/dev/null; then ee "$CRED_FILE"
+                else error "找不到编辑器 (nano/vi/ee)"; press_enter
+                fi ;;
             0) return ;;
             *) error "无效选择" ;;
         esac
     done
 }
 
-# ======================== 扫描参数设置 ========================
+# ======================== 扫描参数 ========================
 
 get_scan_params() {
     local default_port="1080"
-    local default_concurrency="1000"
+    local default_threads="50"
     local default_timeout="5"
 
     echo ""
     read -rp "$(echo -e "${WHITE}端口范围 [默认: ${GREEN}${default_port}${WHITE}]: ${NC}")" scan_port
     [ -z "$scan_port" ] && scan_port="$default_port"
 
-    read -rp "$(echo -e "${WHITE}并发连接数 [默认: ${GREEN}${default_concurrency}${WHITE}]: ${NC}")" scan_concurrency
-    [ -z "$scan_concurrency" ] && scan_concurrency="$default_concurrency"
+    read -rp "$(echo -e "${WHITE}并发线程数 [默认: ${GREEN}${default_threads}${WHITE}]: ${NC}")" scan_threads
+    [ -z "$scan_threads" ] && scan_threads="$default_threads"
 
     read -rp "$(echo -e "${WHITE}超时时间/秒 [默认: ${GREEN}${default_timeout}${WHITE}]: ${NC}")" scan_timeout
     [ -z "$scan_timeout" ] && scan_timeout="$default_timeout"
@@ -341,13 +403,12 @@ get_scan_params() {
     echo -e "${WHITE}参数确认:${NC}"
     echo -e "  IP 来源:  ${GREEN}${IP_FILE}${NC}"
     echo -e "  端口:     ${GREEN}${scan_port}${NC}"
-    echo -e "  并发:     ${GREEN}${scan_concurrency}${NC}"
+    echo -e "  线程:     ${GREEN}${scan_threads}${NC}"
     echo -e "  超时:     ${GREEN}${scan_timeout}秒${NC}"
     echo -e "  输出:     ${GREEN}${OUTPUT_FILE}${NC}"
 
-    # 导出参数供调用方使用
     SCAN_PORT="$scan_port"
-    SCAN_CONCURRENCY="$scan_concurrency"
+    SCAN_THREADS="$scan_threads"
     SCAN_TIMEOUT="$scan_timeout"
 }
 
@@ -377,13 +438,12 @@ check_running() {
     return 0
 }
 
-# 模式1: 纯扫描 (只探测 SOCKS5 握手，不验证连通性)
+# 模式1: 纯扫描
 run_scan_only() {
     title "模式1: 纯扫描"
     echo -e "${WHITE}只进行 SOCKS5 握手探测，发现开放的代理端口${NC}"
     echo -e "${YELLOW}提示: 此模式速度最快，但可能包含蜜罐${NC}"
 
-    check_installed || return
     check_ip_ready  || { press_enter; return; }
     check_running   && { press_enter; return; }
 
@@ -394,11 +454,11 @@ run_scan_only() {
     echo ""
     info "开始纯扫描..."
 
-    cd "$INSTALL_DIR" || return
-    ./$BIN_NAME \
+    cd "$INSTALL_DIR"
+    ./"$BIN_NAME" \
         -i "$IP_FILE" \
         -p "$SCAN_PORT" \
-        -C "$SCAN_CONCURRENCY" \
+        -t "$SCAN_THREADS" \
         -T "$SCAN_TIMEOUT" \
         -o "$OUTPUT_FILE" 2>&1 | tee "$LOG_FILE"
 
@@ -414,13 +474,12 @@ run_scan_only() {
     press_enter
 }
 
-# 模式2: 扫描 + 验证 (完整模式)
+# 模式2: 扫描 + 验证
 run_scan_verify() {
     title "模式2: 扫描 + 验证"
     echo -e "${WHITE}探测 SOCKS5 代理并验证连通性 + 尝试凭证认证${NC}"
     echo -e "${YELLOW}提示: 此模式较慢但结果更准确${NC}"
 
-    check_installed || return
     check_ip_ready  || { press_enter; return; }
     check_running   && { press_enter; return; }
 
@@ -431,12 +490,12 @@ run_scan_verify() {
     echo ""
     info "开始扫描+验证..."
 
-    cd "$INSTALL_DIR" || return
-    ./$BIN_NAME \
+    cd "$INSTALL_DIR"
+    ./"$BIN_NAME" \
         -i "$IP_FILE" \
         -p "$SCAN_PORT" \
         -c "$CRED_FILE" \
-        -C "$SCAN_CONCURRENCY" \
+        -t "$SCAN_THREADS" \
         -T "$SCAN_TIMEOUT" \
         -o "$OUTPUT_FILE" 2>&1 | tee "$LOG_FILE"
 
@@ -452,14 +511,11 @@ run_scan_verify() {
     press_enter
 }
 
-# 模式3: 只验证 (验证已有结果)
+# 模式3: 只验证
 run_verify_only() {
     title "模式3: 验证已有结果"
     echo -e "${WHITE}对已发现的代理重新验证连通性${NC}"
 
-    check_installed || return
-
-    # 检查是否有之前的扫描结果
     if [ ! -f "$OUTPUT_FILE" ] || [ ! -s "$OUTPUT_FILE" ]; then
         error "没有找到扫描结果文件 ($OUTPUT_FILE)"
         warn "请先执行模式1或模式2进行扫描"
@@ -471,7 +527,7 @@ run_verify_only() {
     total=$(wc -l < "$OUTPUT_FILE")
     info "发现 ${total} 条待验证记录"
 
-    # FreeBSD grep 不支持 -oP, 使用 sed 提取 IP:Port
+    # FreeBSD grep 不支持 -oP, 使用 grep -oE
     local verify_list="$INSTALL_DIR/.verify_tmp.txt"
     grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' "$OUTPUT_FILE" 2>/dev/null | sort -u > "$verify_list" || \
     sed -n 's/^\([0-9.]*:[0-9]*\).*/\1/p' "$OUTPUT_FILE" | sort -u > "$verify_list"
@@ -487,11 +543,9 @@ run_verify_only() {
     verify_count=$(wc -l < "$verify_list")
     info "提取到 ${verify_count} 个唯一 IP:Port"
 
-    # 将IP提取到临时check文件
     local verify_ip="$INSTALL_DIR/.verify_ip.txt"
     awk -F: '{print $1}' "$verify_list" | sort -u > "$verify_ip"
 
-    # 提取端口
     local verify_ports
     verify_ports=$(awk -F: '{print $2}' "$verify_list" | sort -un | tr '\n' ',' | sed 's/,$//')
 
@@ -500,10 +554,10 @@ run_verify_only() {
     echo -e "  ${WHITE}验证端口:  ${GREEN}${verify_ports}${NC}"
     echo ""
 
-    local default_concurrency="200"
+    local default_threads="30"
     local default_timeout="8"
-    read -rp "$(echo -e "${WHITE}并发连接数 [默认: ${GREEN}${default_concurrency}${WHITE}]: ${NC}")" vc
-    [ -z "$vc" ] && vc="$default_concurrency"
+    read -rp "$(echo -e "${WHITE}并发线程数 [默认: ${GREEN}${default_threads}${WHITE}]: ${NC}")" vt
+    [ -z "$vt" ] && vt="$default_threads"
     read -rp "$(echo -e "${WHITE}超时时间/秒 [默认: ${GREEN}${default_timeout}${WHITE}]: ${NC}")" vto
     [ -z "$vto" ] && vto="$default_timeout"
 
@@ -515,12 +569,12 @@ run_verify_only() {
     fi
 
     info "开始验证..."
-    cd "$INSTALL_DIR" || return
-    ./$BIN_NAME \
+    cd "$INSTALL_DIR"
+    ./"$BIN_NAME" \
         -i "$verify_ip" \
         -p "$verify_ports" \
         -c "$CRED_FILE" \
-        -C "$vc" \
+        -t "$vt" \
         -T "$vto" \
         -o "$verified_output" 2>&1 | tee "$LOG_FILE"
 
@@ -543,7 +597,6 @@ run_background() {
     title "后台扫描"
     echo -e "${WHITE}扫描将在后台运行，可通过日志查看进度${NC}"
 
-    check_installed || return
     check_ip_ready  || { press_enter; return; }
     check_running   && { press_enter; return; }
 
@@ -551,12 +604,12 @@ run_background() {
     echo ""
     if ! confirm "确认后台启动?"; then return; fi
 
-    cd "$INSTALL_DIR" || return
-    nohup ./$BIN_NAME \
+    cd "$INSTALL_DIR"
+    nohup ./"$BIN_NAME" \
         -i "$IP_FILE" \
         -p "$SCAN_PORT" \
         -c "$CRED_FILE" \
-        -C "$SCAN_CONCURRENCY" \
+        -t "$SCAN_THREADS" \
         -T "$SCAN_TIMEOUT" \
         -o "$OUTPUT_FILE" > "$LOG_FILE" 2>&1 &
 
@@ -565,7 +618,6 @@ run_background() {
     info "后台扫描已启动 (PID: $pid)"
     echo ""
     echo -e "  ${WHITE}查看日志:  ${GREEN}tail -f $LOG_FILE${NC}"
-    echo -e "  ${WHITE}查看进度:  ${GREEN}cat $LOG_FILE | tail -5${NC}"
     echo -e "  ${WHITE}停止扫描:  ${RED}kill $pid${NC}"
     press_enter
 }
@@ -604,28 +656,9 @@ view_results() {
     press_enter
 }
 
-# ======================== 卸载 ========================
+# ======================== 管理主菜单 ========================
 
-uninstall() {
-    title "卸载 S5 Scanner"
-    warn "将删除目录: $INSTALL_DIR"
-    echo ""
-    if confirm "确定要卸载?"; then
-        # 停止运行中的进程
-        if [ -f "$PID_FILE" ]; then
-            local pid
-            pid=$(cat "$PID_FILE")
-            kill "$pid" 2>/dev/null && info "已停止运行中的扫描 (PID: $pid)"
-        fi
-        rm -rf "$INSTALL_DIR"
-        info "卸载完成"
-    fi
-    press_enter
-}
-
-# ======================== 主菜单 ========================
-
-print_main_menu() {
+print_manage_menu() {
     clear 2>/dev/null || true
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
@@ -634,15 +667,14 @@ print_main_menu() {
     echo ""
 
     # 状态
-    local ip_count=0 cred_count=0 result_count=0 status_color="${RED}" status_text="未安装"
+    local ip_count=0 cred_count=0 result_count=0
     [ -f "$IP_FILE" ] && [ -s "$IP_FILE" ] && ip_count=$(grep -cv '^\s*$\|^\s*#' "$IP_FILE" 2>/dev/null || echo 0)
     [ -f "$CRED_FILE" ] && [ -s "$CRED_FILE" ] && cred_count=$(grep -cv '^\s*$\|^\s*#' "$CRED_FILE" 2>/dev/null || echo 0)
     [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ] && result_count=$(wc -l < "$OUTPUT_FILE")
-    [ -f "$INSTALL_DIR/$BIN_NAME" ] && { status_color="${GREEN}"; status_text="已安装"; }
 
-    echo -e "  状态: ${status_color}${status_text}${NC}  |  IP: ${GREEN}${ip_count}${NC}条  |  凭证: ${GREEN}${cred_count}${NC}组  |  结果: ${GREEN}${result_count}${NC}条"
+    echo -e "  IP: ${GREEN}${ip_count}${NC}条  |  凭证: ${GREEN}${cred_count}${NC}组  |  结果: ${GREEN}${result_count}${NC}条"
 
-    # 检查后台扫描
+    # 后台扫描检测
     if [ -f "$PID_FILE" ]; then
         local pid
         pid=$(cat "$PID_FILE")
@@ -664,16 +696,22 @@ print_main_menu() {
     echo ""
     echo -e "  ${WHITE}${BOLD}── 其他 ──${NC}"
     echo -e "  ${GREEN}7.${NC} 查看扫描结果"
-    echo -e "  ${GREEN}8.${NC} 安装 / 更新"
-    echo -e "  ${GREEN}9.${NC} 卸载"
+    echo -e "  ${GREEN}8.${NC} 更新 (重新下载编译)"
     echo -e "  ${RED}0.${NC} 退出"
     echo ""
 }
 
-main() {
+manage_main() {
+    # 检查是否已安装
+    if [ ! -f "$INSTALL_DIR/$BIN_NAME" ]; then
+        error "S5 Scanner 未安装，请先运行安装脚本"
+        echo -e "  ${CYAN}bash <(curl -Ls ${SCRIPT_URL})${NC}"
+        exit 1
+    fi
+
     while true; do
-        print_main_menu
-        read -rp "$(echo -e "${CYAN}请选择 [0-9]: ${NC}")" choice
+        print_manage_menu
+        read -rp "$(echo -e "${CYAN}请选择 [0-8]: ${NC}")" choice
         case "$choice" in
             1) ip_menu ;;
             2) cred_menu ;;
@@ -682,8 +720,7 @@ main() {
             5) run_verify_only ;;
             6) run_background ;;
             7) view_results ;;
-            8) install_or_update; press_enter ;;
-            9) uninstall ;;
+            8) do_install; press_enter ;;
             0) echo -e "\n${GREEN}再见!${NC}\n"; exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -691,4 +728,11 @@ main() {
 }
 
 # ======================== 入口 ========================
-main "$@"
+
+if [ "$1" = "--manage" ]; then
+    # kk 命令入口 → 管理菜单
+    manage_main
+else
+    # curl 入口 → 安装/卸载
+    install_menu
+fi
