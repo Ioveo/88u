@@ -1,8 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  S5 Proxy Scanner - SERV00 一键安装管理脚本
-#  用法: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/serv00.sh)
-#  安装后: 输入 kk 即可启动管理菜单
+#  用法: bash <(curl -Ls https://raw.githubusercontent.com/Ioveo/88u/main/serv00.sh)
 # ============================================================
 
 # ======================== 配置 ========================
@@ -15,10 +14,8 @@ CRED_FILE="$INSTALL_DIR/credentials.txt"
 OUTPUT_FILE="$INSTALL_DIR/socks.txt"
 LOG_FILE="$INSTALL_DIR/scan.log"
 PID_FILE="$INSTALL_DIR/.scan.pid"
-KK_PATH="$HOME/bin/kk"
-
-# GitHub 源码地址 (修改为你的仓库地址)
-GITHUB_RAW="https://raw.githubusercontent.com/你的用户名/你的仓库/main"
+# GitHub 源码地址
+GITHUB_RAW="https://raw.githubusercontent.com/Ioveo/88u/main"
 SRC_URL="${GITHUB_RAW}/socks5.c"
 SCRIPT_URL="${GITHUB_RAW}/serv00.sh"
 
@@ -92,11 +89,11 @@ do_install() {
     # 3. 编译
     info "编译中..."
     cd "$INSTALL_DIR"
-    if cc -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
+    if cc -o "$BIN_NAME" "$SRC_NAME" 2>/dev/null; then
         info "编译成功: $INSTALL_DIR/$BIN_NAME"
-    elif gcc -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
+    elif gcc -o "$BIN_NAME" "$SRC_NAME" 2>/dev/null; then
         info "编译成功 (gcc)"
-    elif clang -o "$BIN_NAME" "$SRC_NAME" -lpthread 2>/dev/null; then
+    elif clang -o "$BIN_NAME" "$SRC_NAME" 2>/dev/null; then
         info "编译成功 (clang)"
     else
         error "编译失败! 请检查编译器是否可用"
@@ -108,44 +105,13 @@ do_install() {
     [ -f "$IP_FILE" ]   || touch "$IP_FILE"
     [ -f "$CRED_FILE" ] || touch "$CRED_FILE"
 
-    # 5. 创建 kk 快捷命令
-    mkdir -p "$HOME/bin"
-    cat > "$KK_PATH" << 'KEOF'
-#!/bin/bash
-exec bash "$HOME/socks5/serv00.sh" --manage
-KEOF
-    chmod +x "$KK_PATH"
-
-    # 6. 确保 ~/bin 在 PATH 中
-    local shell_rc=""
-    if [ -f "$HOME/.bashrc" ]; then
-        shell_rc="$HOME/.bashrc"
-    elif [ -f "$HOME/.profile" ]; then
-        shell_rc="$HOME/.profile"
-    elif [ -f "$HOME/.bash_profile" ]; then
-        shell_rc="$HOME/.bash_profile"
-    fi
-
-    if [ -n "$shell_rc" ]; then
-        if ! grep -q 'HOME/bin' "$shell_rc" 2>/dev/null; then
-            echo '' >> "$shell_rc"
-            echo '# S5 Scanner - kk 快捷命令' >> "$shell_rc"
-            echo 'export PATH="$HOME/bin:$PATH"' >> "$shell_rc"
-            info "已将 ~/bin 添加到 PATH ($shell_rc)"
-        fi
-    fi
-
-    # 临时生效
-    export PATH="$HOME/bin:$PATH"
-
     echo ""
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════╗${NC}"
     echo -e "${GREEN}${BOLD}║       安装完成!                      ║${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${WHITE}输入 ${GREEN}${BOLD}kk${NC} ${WHITE}即可启动管理菜单${NC}"
-    echo -e "  ${WHITE}如果 kk 命令未生效，请先执行:${NC}"
-    echo -e "  ${CYAN}source ~/.bashrc${NC}  ${WHITE}或${NC}  ${CYAN}source ~/.profile${NC}"
+    echo -e "  ${WHITE}运行以下命令启动管理菜单:${NC}"
+    echo -e "  ${CYAN}bash $INSTALL_DIR/$SCRIPT_NAME --manage${NC}"
     echo ""
 }
 
@@ -154,7 +120,7 @@ KEOF
 do_uninstall() {
     title "卸载 S5 Scanner"
 
-    if [ ! -d "$INSTALL_DIR" ] && [ ! -f "$KK_PATH" ]; then
+    if [ ! -d "$INSTALL_DIR" ]; then
         warn "S5 Scanner 未安装"
         press_enter
         return
@@ -162,7 +128,6 @@ do_uninstall() {
 
     warn "将删除以下内容:"
     [ -d "$INSTALL_DIR" ] && echo "  - 目录: $INSTALL_DIR"
-    [ -f "$KK_PATH" ] && echo "  - 命令: $KK_PATH"
     echo ""
 
     if ! confirm "确定要卸载?"; then return; fi
@@ -175,7 +140,6 @@ do_uninstall() {
     fi
 
     rm -rf "$INSTALL_DIR"
-    rm -f "$KK_PATH"
     info "卸载完成"
     press_enter
 }
@@ -211,7 +175,7 @@ install_menu() {
 }
 
 # ================================================================
-#  以下为管理菜单 (通过 kk 命令调用)
+#  以下为管理菜单
 # ================================================================
 
 # ======================== IP 管理 ========================
@@ -237,15 +201,29 @@ add_ip() {
     echo "  CIDR:      192.168.1.0/24"
     echo "  范围:      192.168.1.1-192.168.1.100"
     echo "  简写范围:  192.168.1.1-100"
-    echo "  多个(逗号): 1.2.3.4,5.6.7.8"
     echo ""
-    echo -e "${YELLOW}输入 IP 地址/范围 (输入 q 返回):${NC}"
+    echo -e "${WHITE}输入方式:${NC}"
+    echo "  - 每行输入一个或多个(用空格/逗号分隔，自动拆分)"
+    echo "  - 支持粘贴多行"
+    echo -e "  - 输入 ${YELLOW}q${NC} 返回"
+    echo ""
+    local added=0
     while true; do
         read -rp "> " input
         [ "$input" = "q" ] || [ "$input" = "Q" ] && break
         [ -z "$input" ] && continue
-        echo "$input" >> "$IP_FILE"
-        info "已添加: $input"
+        # 拆分用户输入: 空格/逗号/分号都作为分隔符
+        local IFS_OLD="$IFS"
+        IFS=$', ;\t'
+        for item in $input; do
+            item=$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$item" ] && continue
+            echo "$item" >> "$IP_FILE"
+            added=$((added + 1))
+        done
+        IFS="$IFS_OLD"
+        info "本次添加 ${added} 条 (${input})"
+        added=0
     done
 }
 
@@ -316,16 +294,37 @@ show_cred_list() {
 
 add_cred() {
     title "添加凭证"
-    echo -e "${WHITE}格式: 用户名:密码  (每行一组)${NC}"
+    echo -e "${WHITE}格式: 用户名:密码${NC}"
     echo -e "${WHITE}示例: admin:123456${NC}"
     echo ""
-    echo -e "${YELLOW}输入凭证 (输入 q 返回):${NC}"
+    echo -e "${WHITE}输入方式:${NC}"
+    echo "  - 每行输入一个或多个(用空格/逗号分隔，自动拆分)"
+    echo "  - 支持粘贴多行"
+    echo -e "  - 输入 ${YELLOW}q${NC} 返回"
+    echo ""
+    local added=0
     while true; do
         read -rp "> " input
         [ "$input" = "q" ] || [ "$input" = "Q" ] && break
         [ -z "$input" ] && continue
-        echo "$input" >> "$CRED_FILE"
-        info "已添加: $input"
+        # 拆分用户输入: 空格/逗号/分号都作为分隔符
+        # 但密码中可能包含空格, 所以只按逗号和分号拆分
+        local IFS_OLD="$IFS"
+        IFS=$',;'
+        for item in $input; do
+            item=$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$item" ] && continue
+            # 检查去重
+            if grep -qF "$item" "$CRED_FILE" 2>/dev/null; then
+                warn "已存在,跳过: $item"
+            else
+                echo "$item" >> "$CRED_FILE"
+                added=$((added + 1))
+            fi
+        done
+        IFS="$IFS_OLD"
+        [ $added -gt 0 ] && info "本次添加 ${added} 组凭证"
+        added=0
     done
 }
 
@@ -730,7 +729,6 @@ manage_main() {
 # ======================== 入口 ========================
 
 if [ "$1" = "--manage" ]; then
-    # kk 命令入口 → 管理菜单
     manage_main
 else
     # curl 入口 → 安装/卸载
