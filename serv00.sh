@@ -17,6 +17,7 @@ PID_FILE="$INSTALL_DIR/.scan.pid"
 # GitHub 源码地址
 GITHUB_RAW="https://raw.githubusercontent.com/Ioveo/88u/main"
 SRC_URL="${GITHUB_RAW}/socks5.c"
+PASS_URL="${GITHUB_RAW}/PASS.txt"
 SCRIPT_URL="${GITHUB_RAW}/serv00.sh"
 
 # ======================== 颜色 ========================
@@ -104,6 +105,20 @@ do_install() {
     # 4. 创建默认文件
     [ -f "$IP_FILE" ]   || touch "$IP_FILE"
     [ -f "$CRED_FILE" ] || touch "$CRED_FILE"
+
+    # 5. 下载密码字典
+    info "下载密码字典 PASS.txt ..."
+    if download_file "$PASS_URL" "$INSTALL_DIR/PASS.txt" 2>/dev/null; then
+        # 合并到凭证文件(去重)
+        local before=$(wc -l < "$CRED_FILE" 2>/dev/null || echo 0)
+        cat "$INSTALL_DIR/PASS.txt" >> "$CRED_FILE"
+        # 去重 + 去空行
+        sort -u "$CRED_FILE" | grep -v '^\s*$' > "$CRED_FILE.tmp" && mv "$CRED_FILE.tmp" "$CRED_FILE"
+        local after=$(wc -l < "$CRED_FILE")
+        info "密码字典已导入, 当前共 ${after} 组凭证"
+    else
+        warn "密码字典下载失败(不影响使用)"
+    fi
 
     echo ""
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════╗${NC}"
@@ -345,6 +360,24 @@ add_common_creds() {
     info "已添加 ${#creds[@]} 组常用凭证 (自动去重)"
 }
 
+import_cred_file() {
+    title "从文件导入凭证"
+    echo -e "${WHITE}文件格式: 每行一组 用户名:密码${NC}"
+    read -rp "$(echo -e "${WHITE}输入文件路径: ${NC}")" filepath
+    if [ -f "$filepath" ]; then
+        local before=$(wc -l < "$CRED_FILE" 2>/dev/null || echo 0)
+        cat "$filepath" >> "$CRED_FILE"
+        # 去重 + 去空行
+        sort -u "$CRED_FILE" | grep -v '^\s*$' > "$CRED_FILE.tmp" && mv "$CRED_FILE.tmp" "$CRED_FILE"
+        local after=$(wc -l < "$CRED_FILE")
+        local added=$((after - before))
+        [ $added -lt 0 ] && added=0
+        info "导入完成! 新增 ${added} 组 (当前共 ${after} 组, 已自动去重)"
+    else
+        error "文件不存在: $filepath"
+    fi
+}
+
 clear_cred() {
     if confirm "确定清空所有凭证?"; then
         : > "$CRED_FILE"
@@ -357,18 +390,20 @@ cred_menu() {
         title "凭证(用户名/密码)管理"
         echo -e "  ${GREEN}1.${NC} 查看凭证列表"
         echo -e "  ${GREEN}2.${NC} 手动添加凭证"
-        echo -e "  ${GREEN}3.${NC} 一键添加常用凭证"
-        echo -e "  ${GREEN}4.${NC} 清空凭证列表"
-        echo -e "  ${GREEN}5.${NC} 编辑凭证文件"
+        echo -e "  ${GREEN}3.${NC} 从文件导入凭证"
+        echo -e "  ${GREEN}4.${NC} 一键添加常用凭证"
+        echo -e "  ${GREEN}5.${NC} 清空凭证列表"
+        echo -e "  ${GREEN}6.${NC} 编辑凭证文件"
         echo -e "  ${RED}0.${NC} 返回主菜单"
         echo ""
-        read -rp "$(echo -e "${CYAN}请选择 [0-5]: ${NC}")" choice
+        read -rp "$(echo -e "${CYAN}请选择 [0-6]: ${NC}")" choice
         case "$choice" in
             1) show_cred_list; press_enter ;;
             2) add_cred ;;
-            3) add_common_creds; press_enter ;;
-            4) clear_cred; press_enter ;;
-            5)
+            3) import_cred_file; press_enter ;;
+            4) add_common_creds; press_enter ;;
+            5) clear_cred; press_enter ;;
+            6)
                 [ -f "$CRED_FILE" ] || touch "$CRED_FILE"
                 if command -v nano &>/dev/null; then nano "$CRED_FILE"
                 elif command -v vi &>/dev/null; then vi "$CRED_FILE"
